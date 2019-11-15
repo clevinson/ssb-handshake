@@ -1,7 +1,3 @@
-#![feature(async_await)]
-
-use futures::executor::block_on;
-use futures::io::AllowStdIo;
 use ssb_handshake::*;
 use std::env;
 use std::io::{stdin, stdout, Write};
@@ -28,8 +24,8 @@ fn main() -> Result<(), HandshakeError> {
 
     let (pk, sk) = generate_longterm_keypair();
 
-    let mut stream = AllowStdIo::new(ReadWrite::new(stdin(), stdout()));
-    let mut o = block_on(client(&mut stream, net_key, pk, sk, server_pk))?;
+    let mut stream = ReadWrite::new(stdin(), stdout());
+    let mut o = client(&mut stream, net_key, pk, sk, server_pk)?;
 
     let mut v = o.write_key[..].to_vec();
     v.extend_from_slice(&o.write_noncegen.next()[..]);

@@ -3,8 +3,6 @@
 //! ([repo](https://github.com/ssbc/scuttlebutt-protocol-guide)),
 //! which he graciously released into the public domain.
 
-#![feature(async_await)]
-extern crate futures;
 #[macro_use]
 extern crate quick_error;
 extern crate ssb_crypto;
@@ -12,7 +10,7 @@ extern crate ssb_crypto;
 use ssb_crypto::{handshake::HandshakeKeys, NetworkKey, NonceGen, PublicKey, SecretKey};
 
 use core::mem::size_of;
-use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::io::{self, Read, Write, ErrorKind};
 
 mod error;
 mod utils;
@@ -30,8 +28,8 @@ use crypto::{
 
 // TODO: memzero our secrets, if sodiumoxide doesn't do it for us.
 
-/// Perform the client side of the handshake using the given `AsyncRead + AsyncWrite` stream.
-pub async fn client<S>(
+/// Perform the client side of the handshake using the given `Read + Write` stream.
+pub fn client<S>(
     mut stream: S,
     net_key: NetworkKey,
     pk: PublicKey,
@@ -39,24 +37,7 @@ pub async fn client<S>(
     server_pk: PublicKey,
 ) -> Result<HandshakeKeys, HandshakeError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let r = try_client_side(&mut stream, net_key, pk, sk, server_pk).await;
-    if r.is_err() {
-        stream.close().await.unwrap_or(());
-    }
-    r
-}
-
-async fn try_client_side<S>(
-    mut stream: S,
-    net_key: NetworkKey,
-    pk: PublicKey,
-    sk: SecretKey,
-    server_pk: PublicKey,
-) -> Result<HandshakeKeys, HandshakeError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Read + Write,
 {
     let pk = ClientPublicKey(pk);
     let sk = ClientSecretKey(sk);
@@ -64,12 +45,18 @@ where
 
     let (eph_pk, eph_sk) = gen_client_eph_keypair();
     let hello = ClientHello::new(&eph_pk, &net_key);
-    stream.write_all(&hello.as_slice()).await?;
-    stream.flush().await?;
+    stream.write_all(&hello.as_slice())?;
+    stream.flush()?;
 
     let server_eph_pk = {
         let mut buf = [0u8; size_of::<ServerHello>()];
-        stream.read_exact(&mut buf).await?;
+        let size = stream.read(&mut buf)?;
+
+        if size == 0 {
+            // server verify failed
+            let eof = io::Error::from(ErrorKind::UnexpectedEof);
+            return Err(HandshakeError::Io(eof));
+        }
 
         let server_hello = ServerHello::from_slice(&buf)?;
         server_hello.verify(&net_key)?
@@ -82,11 +69,11 @@ where
 
     // Send client auth
     let client_auth = ClientAuth::new(&sk, &pk, &server_pk, &net_key, &shared_a, &shared_b);
-    stream.write_all(client_auth.as_slice()).await?;
-    stream.flush().await?;
+    stream.write_all(client_auth.as_slice())?;
+    stream.flush()?;
 
     let mut buf = [0u8; 80];
-    stream.read_exact(&mut buf).await?;
+    stream.read_exact(&mut buf)?;
 
     let server_acc = ServerAccept::from_buffer(buf.to_vec())?;
     let v = server_acc.open_and_verify(
@@ -106,31 +93,15 @@ where
     ))
 }
 
-/// Perform the server side of the handshake using the given `AsyncRead + AsyncWrite` stream.
-pub async fn server<S>(
+/// Perform the server side of the handshake using the given `Read + Write` stream.
+pub fn server<S>(
     mut stream: S,
     net_key: NetworkKey,
     pk: PublicKey,
     sk: SecretKey,
 ) -> Result<HandshakeKeys, HandshakeError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let r = try_server_side(&mut stream, net_key, pk, sk).await;
-    if r.is_err() {
-        stream.close().await.unwrap_or(());
-    }
-    r
-}
-
-async fn try_server_side<S>(
-    mut stream: S,
-    net_key: NetworkKey,
-    pk: PublicKey,
-    sk: SecretKey,
-) -> Result<HandshakeKeys, HandshakeError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: Read + Write
 {
     let pk = ServerPublicKey(pk);
     let sk = ServerSecretKey(sk);
@@ -140,15 +111,15 @@ where
     // Receive and verify client hello
     let client_eph_pk = {
         let mut buf = [0u8; 64];
-        stream.read_exact(&mut buf).await?;
+        stream.read_exact(&mut buf)?;
         let client_hello = ClientHello::from_slice(&buf)?;
         client_hello.verify(&net_key)?
     };
 
     // Send server hello
     let hello = ServerHello::new(&eph_pk, &net_key);
-    stream.write_all(hello.as_slice()).await?;
-    stream.flush().await?;
+    stream.write_all(hello.as_slice())?;
+    stream.flush()?;
 
     // Derive shared secrets
     let shared_a = SharedA::server_side(&eph_sk, &client_eph_pk)?;
@@ -157,7 +128,7 @@ where
     // Receive and verify client auth
     let (client_sig, client_pk) = {
         let mut buf = [0u8; 112];
-        stream.read_exact(&mut buf).await?;
+        stream.read_exact(&mut buf)?;
 
         let client_auth = ClientAuth::from_buffer(buf.to_vec())?;
         client_auth.open_and_verify(&pk, &net_key, &shared_a, &shared_b)?
@@ -176,8 +147,8 @@ where
         &shared_b,
         &shared_c,
     );
-    stream.write_all(server_acc.as_slice()).await?;
-    stream.flush().await?;
+    stream.write_all(server_acc.as_slice())?;
+    stream.flush()?;
 
     Ok(server_side_handshake_keys(
         &pk,
@@ -193,91 +164,125 @@ where
 
 #[cfg(test)]
 mod tests {
-    extern crate futures_util;
-
     use super::*;
-    use core::pin::Pin;
-    use core::task::Context;
+    use rb::{RbConsumer, RbProducer, RB, SpscRb, Producer, Consumer};
     use std::io::{self, ErrorKind};
+    use std::{
+        thread,
+        sync::{Arc, RwLock},
+    };
 
-    // For some reason, the futures::join macro is failing to resolve
-    // (as of 2019-04-30 nightly).
-    use futures::executor::block_on;
-    use futures::{future::join, Poll};
-
-    extern crate async_ringbuffer;
-    extern crate pin_utils;
-    use pin_utils::unsafe_pinned;
     use ssb_crypto::{generate_longterm_keypair, NetworkKey, PublicKey};
 
-    struct Duplex<R, W> {
-        r: R,
-        w: W,
+    struct Connection {
+        closed: Arc<RwLock<bool>>,
+        s2c: SpscRb<u8>,
+        c2s: SpscRb<u8>,
     }
-    impl<R, W> Duplex<R, W> {
-        unsafe_pinned!(r: R);
-        unsafe_pinned!(w: W);
+
+    struct Stream {
+        closed: Arc<RwLock<bool>>,
+        writer: Producer<u8>,
+        reader: Consumer<u8>,
     }
-    impl<R, W> AsyncRead for Duplex<R, W>
-    where
-        R: AsyncRead + Unpin,
-    {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut Context,
-            buf: &mut [u8],
-        ) -> Poll<Result<usize, io::Error>> {
-            self.r().poll_read(cx, buf)
+
+    impl Connection {
+        fn new() -> Self {
+            Self {
+                closed: Arc::new(RwLock::new(false)),
+                s2c: SpscRb::new(1024),
+                c2s: SpscRb::new(1024),
+            }
         }
-    }
-    impl<R, W> AsyncWrite for Duplex<R, W>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut Context,
-            buf: &[u8],
-        ) -> Poll<Result<usize, io::Error>> {
-            self.w().poll_write(cx, buf)
+
+        fn server(&self) -> Stream {
+            Stream {
+                closed: self.closed.clone(),
+                writer: self.s2c.producer(),
+                reader: self.c2s.consumer(),
+            }
         }
-        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
-            self.w().poll_flush(cx)
-        }
-        fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), io::Error>> {
-            self.w().poll_close(cx)
+
+        fn client(&self) -> Stream {
+            Stream {
+                closed: self.closed.clone(),
+                writer: self.c2s.producer(),
+                reader: self.s2c.consumer(),
+            }
         }
     }
 
-    type DuplexRingbufStream = Duplex<async_ringbuffer::Reader, async_ringbuffer::Writer>;
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            let mut closed = self.closed.write().unwrap();
+            *closed = true;
+        }
+    }
 
-    fn make_streams() -> (DuplexRingbufStream, DuplexRingbufStream) {
-        let (c2s_w, c2s_r) = async_ringbuffer::ring_buffer(1024);
-        let (s2c_w, s2c_r) = async_ringbuffer::ring_buffer(1024);
+    impl Read for Stream {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
+            let n = buf.len();
+            let mut count = 0;
+            let mut closed = {
+                *self.closed.read().unwrap()
+            };
 
-        (Duplex { r: s2c_r, w: c2s_w }, Duplex { r: c2s_r, w: s2c_w })
+            while count < n && !closed {
+                match self.reader.read(&mut buf[count..]) {
+                    Ok(size) => { count += size },
+                    Err(_) => {}
+                }
+
+                closed = {
+                    *self.closed.read().unwrap()
+                };
+            }
+
+            Ok(count)
+        }
+    }
+
+    impl Write for Stream {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
+            match self.writer.write_blocking(buf) {
+                Some(size) => Ok(size),
+                None => Ok(0),
+            }
+        }
+
+        fn flush(&mut self) -> Result<(), io::Error> {
+            Ok(())
+        }
     }
 
     #[test]
     fn basic() {
-        let (mut c_stream, mut s_stream) = make_streams();
+        let connection = Connection::new();
+        let (mut c_stream, mut s_stream) = (connection.client(), connection.server());
+
         let (s_pk, s_sk) = generate_longterm_keypair();
         let (c_pk, c_sk) = generate_longterm_keypair();
 
         let net_key = NetworkKey::SSB_MAIN_NET;
-        let client_side = client(&mut c_stream, net_key.clone(), c_pk, c_sk, s_pk.clone());
-        let server_side = server(&mut s_stream, net_key.clone(), s_pk, s_sk);
 
-        let (c_out, s_out) = block_on(async { join(client_side, server_side).await });
+        let c_thread_net_key = net_key.clone();
+        let c_thread_s_pk = s_pk.clone();
+        let c_thread = thread::spawn(move || {
+            client(&mut c_stream, c_thread_net_key, c_pk, c_sk, c_thread_s_pk)
+        });
 
-        let mut c_out = c_out.unwrap();
-        let mut s_out = s_out.unwrap();
+        let s_thread_net_key = net_key.clone();
+        let s_thread = thread::spawn(move || {
+            server(&mut s_stream, s_thread_net_key, s_pk, s_sk)
+        });
+
+        let mut c_out = c_thread.join().unwrap().unwrap();
+        let mut s_out = s_thread.join().unwrap().unwrap();
 
         assert_eq!(c_out.write_key, s_out.read_key);
         assert_eq!(c_out.read_key, s_out.write_key);
 
         assert_eq!(c_out.write_noncegen.next(), s_out.read_noncegen.next());
-
         assert_eq!(c_out.read_noncegen.next(), s_out.write_noncegen.next());
     }
 
@@ -290,26 +295,32 @@ mod tests {
 
     #[test]
     fn server_rejects_wrong_netkey() {
-        let (mut c_stream, mut s_stream) = make_streams();
+        let connection = Connection::new();
+        let (mut c_stream, mut s_stream) = (connection.client(), connection.server());
+
         let (s_pk, s_sk) = generate_longterm_keypair();
         let (c_pk, c_sk) = generate_longterm_keypair();
 
-        let client_side = client(
-            &mut c_stream,
-            NetworkKey::random(),
-            c_pk,
-            c_sk,
-            s_pk.clone(),
-        );
-        let server_side = server(&mut s_stream, NetworkKey::random(), s_pk, s_sk);
+        let c_thread_s_pk = s_pk.clone();
+        let c_thread = thread::spawn(move || {
+            let net_key = NetworkKey::random();
+            client(&mut c_stream, net_key, c_pk, c_sk, c_thread_s_pk)
+        });
 
-        let (c_out, s_out) = block_on(async { join(client_side, server_side).await });
+        let s_thread = thread::spawn(move || {
+            let net_key = NetworkKey::random();
+            server(&mut s_stream, net_key, s_pk, s_sk)
+        });
 
+        let c_out = c_thread.join().unwrap();
         assert!(is_eof_err(&c_out));
+
+        let s_out = s_thread.join().unwrap();
         match s_out {
-            Err(HandshakeError::ClientHelloVerifyFailed) => {}
-            _ => panic!(),
-        };
+            Ok(_) => assert!(false, "expected HandshakeError::ClientHelloVerifyFailed, got result"),
+            Err(HandshakeError::ClientHelloVerifyFailed) => assert!(true),
+            Err(e) => assert!(false, "expected HandshakeError::ClientHelloVerifyFailed, got other error: {:?}", e),
+        }
     }
 
     #[test]
@@ -319,7 +330,7 @@ mod tests {
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0,
             ])
-            .unwrap(),
+                .unwrap(),
         );
 
         let (pk, _sk) = generate_longterm_keypair();
@@ -327,16 +338,26 @@ mod tests {
     }
 
     fn test_handshake_with_bad_server_pk(bad_pk: PublicKey) {
-        let (mut c_stream, mut s_stream) = make_streams();
+        let connection = Connection::new();
+        let (mut c_stream, mut s_stream) = (connection.client(), connection.server());
+
         let (s_pk, s_sk) = generate_longterm_keypair();
         let (c_pk, c_sk) = generate_longterm_keypair();
 
         let net_key = NetworkKey::SSB_MAIN_NET;
 
-        let client_side = client(&mut c_stream, net_key.clone(), c_pk, c_sk, bad_pk);
-        let server_side = server(&mut s_stream, net_key.clone(), s_pk, s_sk);
+        let c_thread_net_key = net_key.clone();
+        let c_thread = thread::spawn(move || {
+            client(&mut c_stream, c_thread_net_key, c_pk, c_sk, bad_pk)
+        });
 
-        let (c_out, s_out) = block_on(async { join(client_side, server_side).await });
+        let s_thread_net_key = net_key.clone();
+        let s_thread = thread::spawn(move || {
+            server(&mut s_stream, s_thread_net_key, s_pk, s_sk)
+        });
+
+        let c_out = c_thread.join().unwrap();
+        let s_out = s_thread.join().unwrap();
 
         assert!(c_out.is_err());
         assert!(s_out.is_err());

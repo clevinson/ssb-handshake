@@ -1,7 +1,3 @@
-#![feature(async_await)]
-
-use futures::executor::block_on;
-use futures::io::AllowStdIo;
 use std::env;
 use std::io::{stdin, stdout, Write};
 
@@ -29,8 +25,8 @@ fn main() -> Result<(), HandshakeError> {
     let sk = SecretKey::from_slice(&Vec::from_hex(&args[2]).unwrap()).unwrap();
     let pk = PublicKey::from_slice(&Vec::from_hex(&args[3]).unwrap()).unwrap();
 
-    let mut stream = AllowStdIo::new(ReadWrite::new(stdin(), stdout()));
-    let mut o = block_on(server(&mut stream, net_key, pk, sk))?;
+    let mut stream = ReadWrite::new(stdin(), stdout());
+    let mut o = server(&mut stream, net_key, pk, sk)?;
 
     let mut v = o.write_key[..].to_vec();
     v.extend_from_slice(&o.write_noncegen.next()[..]);
