@@ -10,7 +10,7 @@ extern crate ssb_crypto;
 use ssb_crypto::{handshake::HandshakeKeys, NetworkKey, NonceGen, PublicKey, SecretKey};
 
 use core::mem::size_of;
-use std::io::{self, Read, Write, ErrorKind};
+use std::io::{self, ErrorKind, Read, Write};
 
 mod error;
 mod utils;
@@ -93,15 +93,28 @@ where
     ))
 }
 
-/// Perform the server side of the handshake using the given `Read + Write` stream.
 pub fn server<S>(
-    mut stream: S,
+    stream: S,
     net_key: NetworkKey,
     pk: PublicKey,
     sk: SecretKey,
 ) -> Result<HandshakeKeys, HandshakeError>
 where
-    S: Read + Write
+    S: Read + Write,
+{
+    let (_, hs_keys) = server_with_client_pk(stream, net_key, pk, sk)?;
+    Ok(hs_keys)
+}
+
+/// Perform the server side of the handshake using the given `Read + Write` stream.
+pub fn server_with_client_pk<S>(
+    mut stream: S,
+    net_key: NetworkKey,
+    pk: PublicKey,
+    sk: SecretKey,
+) -> Result<(PublicKey, HandshakeKeys), HandshakeError>
+where
+    S: Read + Write,
 {
     let pk = ServerPublicKey(pk);
     let sk = ServerSecretKey(sk);
@@ -150,26 +163,31 @@ where
     stream.write_all(server_acc.as_slice())?;
     stream.flush()?;
 
-    Ok(server_side_handshake_keys(
-        &pk,
-        &client_pk,
-        &eph_pk,
-        &client_eph_pk,
-        &net_key,
-        &shared_a,
-        &shared_b,
-        &shared_c,
+    let ClientPublicKey(client_public_key) = client_pk;
+
+    Ok((
+        client_public_key,
+        server_side_handshake_keys(
+            &pk,
+            &client_pk,
+            &eph_pk,
+            &client_eph_pk,
+            &net_key,
+            &shared_a,
+            &shared_b,
+            &shared_c,
+        ),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rb::{RbConsumer, RbProducer, RB, SpscRb, Producer, Consumer};
+    use rb::{Consumer, Producer, RbConsumer, RbProducer, SpscRb, RB};
     use std::io::{self, ErrorKind};
     use std::{
-        thread,
         sync::{Arc, RwLock},
+        thread,
     };
 
     use ssb_crypto::{generate_longterm_keypair, NetworkKey, PublicKey};
@@ -223,19 +241,15 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
             let n = buf.len();
             let mut count = 0;
-            let mut closed = {
-                *self.closed.read().unwrap()
-            };
+            let mut closed = { *self.closed.read().unwrap() };
 
             while count < n && !closed {
                 match self.reader.read(&mut buf[count..]) {
-                    Ok(size) => { count += size },
+                    Ok(size) => count += size,
                     Err(_) => {}
                 }
 
-                closed = {
-                    *self.closed.read().unwrap()
-                };
+                closed = { *self.closed.read().unwrap() };
             }
 
             Ok(count)
@@ -272,9 +286,7 @@ mod tests {
         });
 
         let s_thread_net_key = net_key.clone();
-        let s_thread = thread::spawn(move || {
-            server(&mut s_stream, s_thread_net_key, s_pk, s_sk)
-        });
+        let s_thread = thread::spawn(move || server(&mut s_stream, s_thread_net_key, s_pk, s_sk));
 
         let mut c_out = c_thread.join().unwrap().unwrap();
         let mut s_out = s_thread.join().unwrap().unwrap();
@@ -317,9 +329,16 @@ mod tests {
 
         let s_out = s_thread.join().unwrap();
         match s_out {
-            Ok(_) => assert!(false, "expected HandshakeError::ClientHelloVerifyFailed, got result"),
+            Ok(_) => assert!(
+                false,
+                "expected HandshakeError::ClientHelloVerifyFailed, got result"
+            ),
             Err(HandshakeError::ClientHelloVerifyFailed) => assert!(true),
-            Err(e) => assert!(false, "expected HandshakeError::ClientHelloVerifyFailed, got other error: {:?}", e),
+            Err(e) => assert!(
+                false,
+                "expected HandshakeError::ClientHelloVerifyFailed, got other error: {:?}",
+                e
+            ),
         }
     }
 
@@ -330,7 +349,7 @@ mod tests {
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0,
             ])
-                .unwrap(),
+            .unwrap(),
         );
 
         let (pk, _sk) = generate_longterm_keypair();
@@ -347,14 +366,11 @@ mod tests {
         let net_key = NetworkKey::SSB_MAIN_NET;
 
         let c_thread_net_key = net_key.clone();
-        let c_thread = thread::spawn(move || {
-            client(&mut c_stream, c_thread_net_key, c_pk, c_sk, bad_pk)
-        });
+        let c_thread =
+            thread::spawn(move || client(&mut c_stream, c_thread_net_key, c_pk, c_sk, bad_pk));
 
         let s_thread_net_key = net_key.clone();
-        let s_thread = thread::spawn(move || {
-            server(&mut s_stream, s_thread_net_key, s_pk, s_sk)
-        });
+        let s_thread = thread::spawn(move || server(&mut s_stream, s_thread_net_key, s_pk, s_sk));
 
         let c_out = c_thread.join().unwrap();
         let s_out = s_thread.join().unwrap();
@@ -362,5 +378,4 @@ mod tests {
         assert!(c_out.is_err());
         assert!(s_out.is_err());
     }
-
 }
